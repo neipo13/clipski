@@ -1,0 +1,27 @@
+# Build directories
+build/
+out/
+cmake-build-*/
+
+# External SDKs and large binaries (libmpv DLLs, archives)
+external/
+
+# MSVC / Visual Studio artifacts
+.vs/
+*.sln
+*.vcxproj*
+*.user
+*.suo
+*.pdb
+*.ilk
+*.obj
+*.lib
+*.exp
+*.exe
+*.dll
+
+# vcpkg local artifacts
+vcpkg_installed/
+
+# Dear ImGui state
+imgui.ini
