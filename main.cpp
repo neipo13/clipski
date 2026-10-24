@@ -17,11 +17,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 
 namespace fs = std::filesystem;
 
@@ -51,11 +54,21 @@ static Uint32 g_wakeup_on_mpv_render_update = 0;
 static Uint32 g_wakeup_on_mpv_events        = 0;
 static Uint32 g_wakeup_on_export_done       = 0;
 
+struct RoutingConfig {
+    std::string input_root  = "C:\\Users\\Andy\\Videos\\Radeon ReLive";
+    std::string output_root = "D:\\Clips";
+    // Lowercase source folder name -> target folder name
+    std::unordered_map<std::string, std::string> aliases;
+};
+
 struct AppState {
     mpv_handle*         mpv    = nullptr;
     mpv_render_context* mpv_gl = nullptr;
 
+    RoutingConfig config;
+
     std::string current_file;
+    std::string target_output_dir_display;
     bool        file_loaded = false;
     bool        paused      = false;
     double      time_pos    = 0.0;
@@ -89,6 +102,20 @@ static std::string wide_to_utf8(const std::wstring& wstr) {
     return str;
 }
 
+static std::string to_lower_ascii(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return s;
+}
+
+static std::string trim_whitespace(const std::string& s) {
+    size_t first = s.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return "";
+    size_t last = s.find_last_not_of(" \t\r\n");
+    return s.substr(first, last - first + 1);
+}
+
 static void replace_all(std::string& str, const std::string& from, const std::string& to) {
     size_t start_pos = 0;
     while ((start_pos = str.find(from, start_pos)) != std::string::npos) {
@@ -112,6 +139,117 @@ static std::string format_seconds_Arg(float val) {
     char buf[32];
     std::snprintf(buf, sizeof(buf), "%.3f", val);
     return std::string(buf);
+}
+
+// ============================================================================
+// Configuration & Output Directory Resolution
+// ============================================================================
+static fs::path get_exe_directory() {
+    wchar_t buf[MAX_PATH];
+    DWORD len = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    if (len == 0) return fs::current_path();
+    return fs::path(buf).parent_path();
+}
+
+static void load_routing_config(RoutingConfig& cfg) {
+    // Built-in defaults so it works even if clipski.ini is deleted
+    cfg.aliases["rocket league"]               = "Rockets";
+    cfg.aliases["baldur's gate 3"]             = "bg3";
+    cfg.aliases["ea sports college football 27"] = "cfb";
+    cfg.aliases["peak"]                        = "peak";
+
+    fs::path ini_path = get_exe_directory() / "clipski.ini";
+    if (!fs::exists(ini_path)) {
+        // Also check parent / source directory if running from build/Release
+        fs::path alt_path = get_exe_directory().parent_path().parent_path() / "clipski.ini";
+        if (fs::exists(alt_path)) {
+            ini_path = alt_path;
+        } else {
+            return;
+        }
+    }
+
+    std::ifstream file(ini_path);
+    if (!file.is_open()) return;
+
+    std::string section;
+    std::string line;
+    while (std::getline(file, line)) {
+        std::string trimmed = trim_whitespace(line);
+        if (trimmed.empty() || trimmed[0] == '#' || trimmed[0] == ';') continue;
+
+        if (trimmed.front() == '[' && trimmed.back() == ']') {
+            section = to_lower_ascii(trim_whitespace(trimmed.substr(1, trimmed.size() - 2)));
+            continue;
+        }
+
+        size_t eq_pos = trimmed.find('=');
+        if (eq_pos == std::string::npos) continue;
+
+        std::string key = trim_whitespace(trimmed.substr(0, eq_pos));
+        std::string val = trim_whitespace(trimmed.substr(eq_pos + 1));
+        if (key.empty() || val.empty()) continue;
+
+        if (section == "paths") {
+            std::string lkey = to_lower_ascii(key);
+            if (lkey == "input_root") {
+                cfg.input_root = val;
+            } else if (lkey == "output_root") {
+                cfg.output_root = val;
+            }
+        } else if (section == "aliases") {
+            cfg.aliases[to_lower_ascii(key)] = val;
+        }
+    }
+}
+
+// Determines where exported clips for `input_filepath` should be saved.
+// If `input_filepath` is inside `config.input_root\<GameFolder>\...`, routes to `config.output_root\<MappedGameFolder>\`.
+// Otherwise, saves in the same folder as `input_filepath`.
+static fs::path resolve_output_directory(const RoutingConfig& cfg, const fs::path& in_path) {
+    fs::path default_dir = in_path.parent_path();
+    if (cfg.input_root.empty() || cfg.output_root.empty()) {
+        return default_dir;
+    }
+
+    std::error_code ec;
+    fs::path norm_in   = fs::weakly_canonical(in_path, ec);
+    fs::path norm_root = fs::weakly_canonical(fs::u8path(cfg.input_root), ec);
+
+    std::string in_str   = to_lower_ascii(norm_in.u8string());
+    std::string root_str = to_lower_ascii(norm_root.u8string());
+
+    if (!root_str.empty() && (root_str.back() == '\\' || root_str.back() == '/')) {
+        root_str.pop_back();
+    }
+
+    // Check if norm_in starts with norm_root + separator
+    if (in_str.size() > root_str.size() &&
+        in_str.compare(0, root_str.size(), root_str) == 0 &&
+        (in_str[root_str.size()] == '\\' || in_str[root_str.size()] == '/')) {
+
+        // Extract relative path inside input_root
+        fs::path rel = norm_in.lexically_relative(norm_root);
+        auto it = rel.begin();
+        if (it != rel.end()) {
+            // Check if the file is inside a game subfolder (i.e., rel has at least 2 components: <GameFolder>/<file.mp4>)
+            auto next_it = it;
+            ++next_it;
+            if (next_it != rel.end()) {
+                std::string game_folder = it->u8string();
+                std::string mapped_folder = game_folder;
+
+                auto alias_it = cfg.aliases.find(to_lower_ascii(game_folder));
+                if (alias_it != cfg.aliases.end()) {
+                    mapped_folder = alias_it->second;
+                }
+
+                return fs::u8path(cfg.output_root) / fs::u8path(mapped_folder);
+            }
+        }
+    }
+
+    return default_dir;
 }
 
 // ============================================================================
@@ -209,6 +347,9 @@ static void load_video_file(AppState& app, const std::string& filepath) {
     app.loop_clip    = false;
     app.export_status_msg.clear();
 
+    fs::path out_dir = resolve_output_directory(app.config, fs::u8path(filepath));
+    app.target_output_dir_display = out_dir.u8string();
+
     const char* no_val = "no";
     mpv_set_property_async(app.mpv, 0, "ab-loop-a", MPV_FORMAT_STRING, &no_val);
     mpv_set_property_async(app.mpv, 0, "ab-loop-b", MPV_FORMAT_STRING, &no_val);
@@ -256,22 +397,28 @@ static void start_export_async(AppState& app, ExportPreset preset) {
             break;
     }
 
-    fs::path in_path  = fs::u8path(app.current_file);
-    fs::path out_path = in_path.parent_path() / (in_path.stem().u8string() + suffix);
+    fs::path in_path = fs::u8path(app.current_file);
+    fs::path out_dir = resolve_output_directory(app.config, in_path);
+
+    // Ensure target output directory exists (e.g., auto-creates D:\Clips\<New Game>\)
+    std::error_code ec;
+    fs::create_directories(out_dir, ec);
+
+    fs::path out_path = out_dir / (in_path.stem().u8string() + suffix);
 
     replace_all(args, "{start}", format_seconds_Arg(app.trim_start));
     replace_all(args, "{end}", format_seconds_Arg(app.trim_end));
     replace_all(args, "{input}", in_path.u8string());
     replace_all(args, "{output}", out_path.u8string());
 
-    std::string full_cmd     = "ffmpeg.exe " + args;
-    std::string out_filename = out_path.filename().u8string();
+    std::string full_cmd    = "ffmpeg.exe " + args;
+    std::string out_display = out_path.u8string();
 
     app.is_exporting.store(true);
     app.export_Result.store(0);
     app.export_status_msg = label;
 
-    std::thread([&app, full_cmd, out_filename]() {
+    std::thread([&app, full_cmd, out_display]() {
         std::wstring wcmd = utf8_to_wide(full_cmd);
 
         STARTUPINFOW si{};
@@ -303,7 +450,7 @@ static void start_export_async(AppState& app, ExportPreset preset) {
         }
 
         app.export_status_msg = (result == 1)
-            ? ("Saved: " + out_filename)
+            ? ("Saved -> " + out_display)
             : "Export Failed (check ffmpeg in PATH)";
         app.export_Result.store(result);
         app.is_exporting.store(false);
@@ -369,8 +516,11 @@ int main(int argc, char* argv[]) {
     ImGui_ImplSDL2_InitForOpenGL(window, gl_context);
     ImGui_ImplOpenGL3_Init(glsl_version);
 
-    // Initialize libmpv
+    // Initialize AppState & load clipski.ini routing rules
     AppState app{};
+    load_routing_config(app.config);
+
+    // Initialize libmpv
     app.mpv = mpv_create();
     if (!app.mpv) {
         return 1;
@@ -574,7 +724,7 @@ int main(int argc, char* argv[]) {
             }
             ImGui::SameLine();
 
-            // When "Loop Clip" is checked, optionally bound the scrubber or keep full timeline with visual markers
+            // When "Loop Clip" is checked, bound the scrubber to the clip range
             float current_sec = static_cast<float>(app.time_pos);
             float scrub_min   = (app.loop_clip && app.trim_end > app.trim_start) ? app.trim_start : 0.0f;
             float scrub_max   = (app.loop_clip && app.trim_end > app.trim_start) ? app.trim_end   : max_dur;
@@ -662,7 +812,7 @@ int main(int argc, char* argv[]) {
                 ImGui::TextDisabled("Right-click a video -> Trim with Clipski (or drag & drop here)");
             } else {
                 float clip_len = std::max(0.0f, app.trim_end - app.trim_start);
-                ImGui::TextDisabled("Clip: %.2fs  |  Hotkeys: S/E (Trim)  L (Loop Clip)  Arrows (Seek)  ,/. (Frame)", clip_len);
+                ImGui::TextDisabled("Clip: %.2fs  |  Out -> %s\\", clip_len, app.target_output_dir_display.c_str());
             }
         }
         ImGui::End();

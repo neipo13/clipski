@@ -69,6 +69,30 @@ foreach ($ext in $exts) {
 
 ---
 
+## Automatic Game Folder Routing (`clipski.ini`)
+
+When you open a video located inside your configured `input_root` (e.g. `C:\Users\Andy\Videos\Radeon ReLive\<GameFolder>\<clip.mp4>`), Clipski automatically routes the exported clip to `output_root` (`D:\Clips\<GameFolder>\`), creating the destination folder if it doesn't exist yet.
+
+To keep your Windows Quick Access names clean and distinct, you can map source game folder names to shorthand target folder names in [`clipski.ini`](clipski.ini):
+
+```ini
+[Paths]
+input_root  = C:\Users\Andy\Videos\Radeon ReLive
+output_root = D:\Clips
+
+[Aliases]
+Rocket League = Rockets
+Baldur's Gate 3 = bg3
+EA SPORTS College Football 27 = cfb
+PEAK = peak
+```
+
+- **Aliased Game:** Opening `C:\Users\Andy\Videos\Radeon ReLive\Rocket League\clip.mp4` exports to `D:\Clips\Rockets\`.
+- **New/Unlisted Game:** Opening `C:\Users\Andy\Videos\Radeon ReLive\Star Wars Galactic Racer\clip.mp4` automatically creates and exports to `D:\Clips\Star Wars Galactic Racer\`.
+- **Outside `input_root`:** Opening any video outside `Radeon ReLive` exports directly alongside the original video file.
+
+---
+
 ## Customizing FFmpeg Presets
 
 Open [`main.cpp`](main.cpp) and edit the command templates at the top of the file:

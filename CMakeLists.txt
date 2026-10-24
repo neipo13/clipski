@@ -103,3 +103,11 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/external/mpv/libmpv-2.dll")
     )
 endif()
 
+if(EXISTS "${CMAKE_SOURCE_DIR}/clipski.ini")
+    add_custom_command(TARGET clipski POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/clipski.ini"
+            "$<TARGET_FILE_DIR:clipski>/clipski.ini"
+    )
+endif()
+
