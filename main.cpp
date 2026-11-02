@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -69,6 +70,7 @@ struct AppState {
 
     std::string current_file;
     std::string target_output_dir_display;
+    char        custom_clip_name[256] = {};
     bool        file_loaded = false;
     bool        paused      = false;
     double      time_pos    = 0.0;
@@ -116,6 +118,43 @@ static std::string trim_whitespace(const std::string& s) {
     return s.substr(first, last - first + 1);
 }
 
+// Sanitizes a user-typed clip name: trims outer whitespace, converts runs of spaces to '-',
+// strips characters illegal in Windows filenames (<>:"/\|?*), and strips trailing '.mp4' if typed.
+static std::string sanitize_custom_name(const std::string& raw) {
+    std::string trimmed = trim_whitespace(raw);
+    if (trimmed.empty()) return "";
+
+    // Strip ".mp4" if the user explicitly typed it
+    if (trimmed.size() > 4 && to_lower_ascii(trimmed.substr(trimmed.size() - 4)) == ".mp4") {
+        trimmed = trim_whitespace(trimmed.substr(0, trimmed.size() - 4));
+    }
+
+    std::string out;
+    out.reserve(trimmed.size());
+    bool last_was_dash = false;
+
+    for (unsigned char c : trimmed) {
+        if (c == ' ' || c == '\t' || c == '-') {
+            if (!out.empty() && !last_was_dash) {
+                out.push_back('-');
+                last_was_dash = true;
+            }
+        } else if (c == '<' || c == '>' || c == ':' || c == '"' ||
+                   c == '/' || c == '\\' || c == '|' || c == '?' || c == '*' || c < 32) {
+            // Skip illegal Windows filename characters
+            continue;
+        } else {
+            out.push_back(static_cast<char>(c));
+            last_was_dash = false;
+        }
+    }
+
+    while (!out.empty() && (out.back() == '-' || out.back() == '.')) {
+        out.pop_back();
+    }
+    return out;
+}
+
 static void replace_all(std::string& str, const std::string& from, const std::string& to) {
     size_t start_pos = 0;
     while ((start_pos = str.find(from, start_pos)) != std::string::npos) {
@@ -153,10 +192,10 @@ static fs::path get_exe_directory() {
 
 static void load_routing_config(RoutingConfig& cfg) {
     // Built-in defaults so it works even if clipski.ini is deleted
-    cfg.aliases["rocket league"]               = "Rockets";
-    cfg.aliases["baldur's gate 3"]             = "bg3";
+    cfg.aliases["rocket league"]                 = "Rockets";
+    cfg.aliases["baldur's gate 3"]               = "bg3";
     cfg.aliases["ea sports college football 27"] = "cfb";
-    cfg.aliases["peak"]                        = "peak";
+    cfg.aliases["peak"]                          = "peak";
 
     fs::path ini_path = get_exe_directory() / "clipski.ini";
     if (!fs::exists(ini_path)) {
@@ -345,6 +384,7 @@ static void load_video_file(AppState& app, const std::string& filepath) {
     app.trim_start   = 0.0f;
     app.trim_end     = 0.0f;
     app.loop_clip    = false;
+    app.custom_clip_name[0] = '\0';
     app.export_status_msg.clear();
 
     fs::path out_dir = resolve_output_directory(app.config, fs::u8path(filepath));
@@ -404,7 +444,13 @@ static void start_export_async(AppState& app, ExportPreset preset) {
     std::error_code ec;
     fs::create_directories(out_dir, ec);
 
-    fs::path out_path = out_dir / (in_path.stem().u8string() + suffix);
+    // If custom name is entered, convert spaces to '-' and omit the _compressed suffix
+    std::string custom_sanitized = sanitize_custom_name(app.custom_clip_name);
+    std::string final_filename   = custom_sanitized.empty()
+                                       ? (in_path.stem().u8string() + suffix)
+                                       : (custom_sanitized + ".mp4");
+
+    fs::path out_path = out_dir / fs::u8path(final_filename);
 
     replace_all(args, "{start}", format_seconds_Arg(app.trim_start));
     replace_all(args, "{end}", format_seconds_Arg(app.trim_end));
@@ -628,6 +674,10 @@ int main(int argc, char* argv[]) {
                         frame_step(app, true);
                         redraw = true;
                     }
+                } else if (event.type == SDL_KEYDOWN && io.WantCaptureKeyboard) {
+                    redraw = true;
+                } else if (event.type == SDL_TEXTINPUT) {
+                    redraw = true;
                 } else if (event.type == g_wakeup_on_mpv_render_update) {
                     uint64_t flags = mpv_render_context_update(app.mpv_gl);
                     if (flags & MPV_RENDER_UPDATE_FRAME) {
@@ -784,7 +834,11 @@ int main(int argc, char* argv[]) {
                 sync_ab_loop(app);
             }
 
-            // Row 3: Export Buttons (Discord 1080p, Discord 720p, Fast Lossless Copy) + Status
+            // Row 3: Custom Clip Name Input + Export Buttons + Live Output Preview
+            ImGui::SetNextItemWidth(220.0f);
+            ImGui::InputTextWithHint("##ClipName", "Clip name (optional)...", app.custom_clip_name, sizeof(app.custom_clip_name));
+            ImGui::SameLine();
+
             bool can_export = app.file_loaded && !app.is_exporting.load() && (app.trim_end > app.trim_start);
             if (!can_export) ImGui::BeginDisabled();
             if (ImGui::Button("Save Discord 1080p", ImVec2(145.0f, 0.0f))) {
@@ -795,7 +849,7 @@ int main(int argc, char* argv[]) {
                 start_export_async(app, ExportPreset::Discord720p);
             }
             ImGui::SameLine();
-            if (ImGui::Button("Save Raw Copy", ImVec2(120.0f, 0.0f))) {
+            if (ImGui::Button("Save Raw Copy", ImVec2(115.0f, 0.0f))) {
                 start_export_async(app, ExportPreset::StreamCopy);
             }
             if (!can_export) ImGui::EndDisabled();
@@ -812,7 +866,17 @@ int main(int argc, char* argv[]) {
                 ImGui::TextDisabled("Right-click a video -> Trim with Clipski (or drag & drop here)");
             } else {
                 float clip_len = std::max(0.0f, app.trim_end - app.trim_start);
-                ImGui::TextDisabled("Clip: %.2fs  |  Out -> %s\\", clip_len, app.target_output_dir_display.c_str());
+                std::string preview_name = sanitize_custom_name(app.custom_clip_name);
+                if (!preview_name.empty()) {
+                    ImGui::TextDisabled("Clip: %.2fs  |  Out -> %s\\%s.mp4",
+                                        clip_len,
+                                        app.target_output_dir_display.c_str(),
+                                        preview_name.c_str());
+                } else {
+                    ImGui::TextDisabled("Clip: %.2fs  |  Out -> %s\\",
+                                        clip_len,
+                                        app.target_output_dir_display.c_str());
+                }
             }
         }
         ImGui::End();

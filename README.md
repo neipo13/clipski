@@ -10,6 +10,7 @@ A fast, minimal, single-file C++17 desktop video trimmer for Windows built with 
 - **Hardware-Accelerated Playback:** Powered by `libmpv` (`hwdec=auto`) rendering directly to an OpenGL 3.2 Core context with zero idle CPU usage (`SDL_WaitEvent` + `mpv_render_context_set_update_callback`).
 - **Live Clip Loop Preview (`L`):** Toggle **Loop Clip** to lock playback and the timeline scrubber strictly between your `Start` and `End` trim points using `libmpv`'s hardware A-B loop.
 - **One-Click Discord & Lossless Exports:**
+  - **Custom Clip Naming:** Type an optional name (e.g. `"clean reset pop"`) to automatically format spaces as `-` (`clean-reset-pop.mp4`) and omit the `_compressed` suffix, or leave blank to use the original filename + preset suffix.
   - **Save Discord 1080p:** Exports `<name>_compressed_1080.mp4` (`60fps`, `libx264`, `-crf 23`, `-preset slower`).
   - **Save Discord 720p:** Exports `<name>_compressed_720.mp4` (`60fps`, `libx264`, `-crf 32`, `-preset slower`).
   - **Save Raw Copy:** Exports `<name>_trimmed.mp4` (`-c copy`, instant lossless stream copy with zero re-encoding).
