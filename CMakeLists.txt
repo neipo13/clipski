@@ -71,7 +71,7 @@ set_target_properties(mpv_target PROPERTIES
 )
 
 # Executable target (WIN32 prevents the black command prompt window from appearing)
-add_executable(clipski WIN32 main.cpp clipski.rc)
+add_executable(clipski WIN32 src/main.cpp assets/clipski.rc)
 
 target_link_libraries(clipski PRIVATE
     SDL2::SDL2

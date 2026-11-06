@@ -2,6 +2,8 @@
 
 A fast, minimal, single-file C++17 desktop video trimmer for Windows built with **SDL2 (OpenGL)**, **libmpv**, and **Dear ImGui**. Designed for effortless game clipping directly from the Windows right-click menu.
 
+![Clipski Screenshot](assets/screenshot.png)
+
 ---
 
 ## Features
@@ -55,7 +57,7 @@ Run the following in PowerShell (no Administrator privileges required) to add **
 
 ```powershell
 $exePath  = "$PSScriptRoot\build\Release\clipski.exe"
-$menuIcon = "$PSScriptRoot\clipski_menu.ico"
+$menuIcon = "$PSScriptRoot\assets\clipski_menu.ico"
 $exts     = @(".mp4", ".mkv", ".mov", ".webm", ".avi")
 
 foreach ($ext in $exts) {
@@ -96,7 +98,7 @@ PEAK = peak
 
 ## Customizing FFmpeg Presets
 
-Open [`main.cpp`](main.cpp) and edit the command templates at the top of the file:
+Open [`src/main.cpp`](src/main.cpp) and edit the command templates at the top of the file:
 ```cpp
 static const std::string FFMPEG_ARGS_DISCORD_1080P =
     "-y -ss {start} -to {end} -i \"{input}\" -vf \"scale=-2:1080,fps=60\" -crf 23 -preset slower -c:v libx264 -c:a aac -b:a 128k \"{output}\"";
