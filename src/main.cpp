@@ -527,18 +527,23 @@ int main(int argc, char* argv[]) {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
 
+    constexpr int kDefaultVideoWidth  = 1280;
+    constexpr int kDefaultVideoHeight = 720;
+    constexpr int kOverlayHeight      = 114;
+
     SDL_Window* window = SDL_CreateWindow(
         "Clipski - Video Trimmer",
         SDL_WINDOWPOS_CENTERED,
         SDL_WINDOWPOS_CENTERED,
-        1280,
-        720,
+        kDefaultVideoWidth,
+        kDefaultVideoHeight + kOverlayHeight,
         SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
     );
     if (!window) {
         SDL_Quit();
         return 1;
     }
+    SDL_SetWindowMinimumSize(window, 640, 360 + kOverlayHeight);
 
     SDL_GLContext gl_context = SDL_GL_CreateContext(window);
     SDL_GL_MakeCurrent(window, gl_context);
@@ -612,8 +617,9 @@ int main(int argc, char* argv[]) {
         LocalFree(wargv);
     }
 
-    bool running = true;
-    bool redraw  = true;
+    bool   running            = true;
+    bool   redraw             = true;
+    double last_margin_bottom = -1.0;
 
     while (running) {
         SDL_Event event;
@@ -728,7 +734,17 @@ int main(int argc, char* argv[]) {
         }
         redraw = false;
 
-        // Query drawable size for high-DPI accuracy
+        // Query window and drawable size for high-DPI accuracy
+        int win_w = 0, win_h = 0;
+        SDL_GetWindowSize(window, &win_w, &win_h);
+        if (win_h > 0) {
+            double margin_bottom = std::clamp(static_cast<double>(kOverlayHeight) / static_cast<double>(win_h), 0.0, 0.9);
+            if (std::abs(margin_bottom - last_margin_bottom) > 1e-5) {
+                last_margin_bottom = margin_bottom;
+                mpv_set_property(app.mpv, "video-margin-ratio-bottom", MPV_FORMAT_DOUBLE, &margin_bottom);
+            }
+        }
+
         int draw_w = 0, draw_h = 0;
         SDL_GL_GetDrawableSize(window, &draw_w, &draw_h);
 
@@ -747,12 +763,12 @@ int main(int argc, char* argv[]) {
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
 
-        // Bottom-docked overlay
-        const float overlay_height = 114.0f;
+        // Bottom-docked control panel
+        const float overlay_height = static_cast<float>(kOverlayHeight);
         ImGuiViewport* viewport = ImGui::GetMainViewport();
         ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x, viewport->WorkPos.y + viewport->WorkSize.y - overlay_height));
         ImGui::SetNextWindowSize(ImVec2(viewport->WorkSize.x, overlay_height));
-        ImGui::SetNextWindowBgAlpha(0.84f);
+        ImGui::SetNextWindowBgAlpha(1.0f);
 
         ImGuiWindowFlags win_flags = ImGuiWindowFlags_NoTitleBar |
                                      ImGuiWindowFlags_NoResize |
