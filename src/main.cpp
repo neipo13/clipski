@@ -80,9 +80,11 @@ struct AppState {
     float trim_end   = 0.0f;
     bool  loop_clip  = false; // When true, loops strictly between trim_start and trim_end
 
+    // The export thread only touches export_Result; everything else is UI-thread only
     std::atomic<bool> is_exporting{false};
     std::atomic<int>  export_Result{0}; // 0 = none, 1 = success, -1 = error
     std::string       export_status_msg;
+    std::string       export_out_path;
 };
 
 // ============================================================================
@@ -464,14 +466,14 @@ static void start_export_async(AppState& app, ExportPreset preset) {
     replace_all(args, "{input}", in_path.u8string());
     replace_all(args, "{output}", out_path.u8string());
 
-    std::string full_cmd    = "ffmpeg.exe " + args;
-    std::string out_display = out_path.u8string();
+    std::string full_cmd = "ffmpeg.exe " + args;
 
     app.is_exporting.store(true);
     app.export_Result.store(0);
     app.export_status_msg = label;
+    app.export_out_path   = out_path.u8string();
 
-    std::thread([&app, full_cmd, out_display]() {
+    std::thread([&app, full_cmd]() {
         std::wstring wcmd = utf8_to_wide(full_cmd);
 
         STARTUPINFOW si{};
@@ -502,11 +504,8 @@ static void start_export_async(AppState& app, ExportPreset preset) {
             CloseHandle(pi.hThread);
         }
 
-        app.export_status_msg = (result == 1)
-            ? ("Saved -> " + out_display)
-            : "Export Failed (check ffmpeg in PATH)";
+        // Report only the result; the UI thread updates the message and clears is_exporting
         app.export_Result.store(result);
-        app.is_exporting.store(false);
 
         SDL_Event ev{};
         ev.type = g_wakeup_on_export_done;
@@ -726,6 +725,10 @@ int main(int argc, char* argv[]) {
                         }
                     }
                 } else if (event.type == g_wakeup_on_export_done) {
+                    app.export_status_msg = (app.export_Result.load() == 1)
+                        ? ("Saved -> " + app.export_out_path)
+                        : "Export Failed (check ffmpeg in PATH)";
+                    app.is_exporting.store(false);
                     redraw = true;
                 } else if (event.type == SDL_MOUSEMOTION ||
                            event.type == SDL_MOUSEBUTTONDOWN ||
