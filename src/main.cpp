@@ -73,6 +73,7 @@ struct AppState {
     char        custom_clip_name[256] = {};
     bool        file_loaded = false;
     bool        paused      = false;
+    bool        quit_prompt_open = false; // Window was closed during an export; asking what to do
     double      time_pos    = 0.0;
     double      duration    = 0.0;
 
@@ -85,6 +86,8 @@ struct AppState {
     std::atomic<int>  export_Result{0}; // 0 = none, 1 = success, -1 = error
     std::string       export_status_msg;
     std::string       export_out_path;
+    std::thread       export_thread;            // Waits on ffmpeg; joined when the export ends
+    HANDLE            export_process = nullptr; // ffmpeg process, so a quit can cancel it
 };
 
 // ============================================================================
@@ -466,51 +469,83 @@ static void start_export_async(AppState& app, ExportPreset preset) {
     replace_all(args, "{input}", in_path.u8string());
     replace_all(args, "{output}", out_path.u8string());
 
-    std::string full_cmd = "ffmpeg.exe " + args;
+    // Launch ffmpeg here on the UI thread so the app owns the process handle (needed to cancel on quit)
+    std::wstring wcmd = utf8_to_wide("ffmpeg.exe " + args);
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+
+    BOOL launched = CreateProcessW(
+        nullptr,
+        wcmd.data(), // Command line (modifiable buffer required by CreateProcessW)
+        nullptr,
+        nullptr,
+        FALSE,
+        CREATE_NO_WINDOW,
+        nullptr,
+        nullptr,
+        &si,
+        &pi
+    );
+    if (!launched) {
+        app.export_Result.store(-1);
+        app.export_status_msg = "Export Failed (check ffmpeg in PATH)";
+        return;
+    }
+    CloseHandle(pi.hThread);
 
     app.is_exporting.store(true);
     app.export_Result.store(0);
     app.export_status_msg = label;
-    app.export_out_path   = out_path.u8string();
+    app.export_out_path   = out_path.u8string(); // The exact (deduplicated) file this export writes
+    app.export_process    = pi.hProcess;
 
-    std::thread([&app, full_cmd]() {
-        std::wstring wcmd = utf8_to_wide(full_cmd);
-
-        STARTUPINFOW si{};
-        si.cb = sizeof(si);
-        PROCESS_INFORMATION pi{};
-
-        BOOL launched = CreateProcessW(
-            nullptr,
-            wcmd.data(), // Command line (modifiable buffer required by CreateProcessW)
-            nullptr,
-            nullptr,
-            FALSE,
-            CREATE_NO_WINDOW,
-            nullptr,
-            nullptr,
-            &si,
-            &pi
-        );
-
-        int result = -1;
-        if (launched) {
-            WaitForSingleObject(pi.hProcess, INFINITE);
-            DWORD exit_code = 1;
-            if (GetExitCodeProcess(pi.hProcess, &exit_code) && exit_code == 0) {
-                result = 1;
-            }
-            CloseHandle(pi.hProcess);
-            CloseHandle(pi.hThread);
-        }
-
-        // Report only the result; the UI thread updates the message and clears is_exporting
-        app.export_Result.store(result);
+    // Background thread only waits for ffmpeg and reports the result;
+    // the UI thread updates the message and cleans up when it handles the done event
+    app.export_thread = std::thread([&app, process = pi.hProcess]() {
+        WaitForSingleObject(process, INFINITE);
+        DWORD exit_code = 1;
+        bool ok = GetExitCodeProcess(process, &exit_code) && exit_code == 0;
+        app.export_Result.store(ok ? 1 : -1);
 
         SDL_Event ev{};
         ev.type = g_wakeup_on_export_done;
         SDL_PushEvent(&ev);
-    }).detach();
+    });
+}
+
+// Joins the wait thread and closes the ffmpeg handle once the process has exited
+static void finish_export(AppState& app) {
+    if (app.export_thread.joinable()) {
+        app.export_thread.join();
+    }
+    if (app.export_process) {
+        CloseHandle(app.export_process);
+        app.export_process = nullptr;
+    }
+    app.is_exporting.store(false);
+}
+
+// Used by the quit-during-export popup: kills ffmpeg and deletes the unfinished file.
+static void cancel_export(AppState& app) {
+    if (!app.is_exporting.load()) {
+        return;
+    }
+
+    TerminateProcess(app.export_process, 1);
+    finish_export(app);
+
+    // If ffmpeg happened to finish while the box was open, keep the completed clip.
+    // Otherwise delete only this export's own file; earlier clips (e.g. name.mp4 when this is name_2.mp4) are untouched.
+    if (app.export_Result.load() != 1) {
+        fs::path partial = fs::u8path(app.export_out_path);
+        std::error_code ec;
+        // ffmpeg's file handle can take a moment to release after termination
+        for (int attempt = 0; attempt < 20 && fs::exists(partial, ec); ++attempt) {
+            if (fs::remove(partial, ec)) break;
+            Sleep(50);
+        }
+    }
 }
 
 // ============================================================================
@@ -637,7 +672,12 @@ int main(int argc, char* argv[]) {
                 ImGui_ImplSDL2_ProcessEvent(&event);
 
                 if (event.type == SDL_QUIT) {
-                    running = false;
+                    if (app.is_exporting.load()) {
+                        app.quit_prompt_open = true; // Ask in-app first (see popup below)
+                    } else {
+                        running = false;
+                    }
+                    redraw = true;
                 } else if (event.type == SDL_WINDOWEVENT) {
                     if (event.window.event == SDL_WINDOWEVENT_EXPOSED ||
                         event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
@@ -651,7 +691,7 @@ int main(int argc, char* argv[]) {
                         SDL_free(dropped_file);
                         redraw = true;
                     }
-                } else if (event.type == SDL_KEYDOWN && !io.WantCaptureKeyboard) {
+                } else if (event.type == SDL_KEYDOWN && !io.WantCaptureKeyboard && !app.quit_prompt_open) {
                     SDL_Keycode key = event.key.keysym.sym;
                     bool shift = (event.key.keysym.mod & KMOD_SHIFT) != 0;
 
@@ -686,7 +726,7 @@ int main(int argc, char* argv[]) {
                         frame_step(app, true);
                         redraw = true;
                     }
-                } else if (event.type == SDL_KEYDOWN && io.WantCaptureKeyboard) {
+                } else if (event.type == SDL_KEYDOWN) { // Keys going to ImGui (text box, quit popup)
                     redraw = true;
                 } else if (event.type == SDL_TEXTINPUT) {
                     redraw = true;
@@ -725,10 +765,12 @@ int main(int argc, char* argv[]) {
                         }
                     }
                 } else if (event.type == g_wakeup_on_export_done) {
-                    app.export_status_msg = (app.export_Result.load() == 1)
-                        ? ("Saved -> " + app.export_out_path)
-                        : "Export Failed (check ffmpeg in PATH)";
-                    app.is_exporting.store(false);
+                    if (app.is_exporting.load()) { // Not already cleaned up by a cancel-on-quit
+                        finish_export(app);
+                        app.export_status_msg = (app.export_Result.load() == 1)
+                            ? ("Saved -> " + app.export_out_path)
+                            : "Export Failed (check ffmpeg in PATH)";
+                    }
                     redraw = true;
                 } else if (event.type == SDL_MOUSEMOTION ||
                            event.type == SDL_MOUSEBUTTONDOWN ||
@@ -907,6 +949,47 @@ int main(int argc, char* argv[]) {
         }
         ImGui::End();
 
+        // Quit-during-export popup, opened when the window is closed while ffmpeg is running
+        if (app.quit_prompt_open) {
+            if (!app.is_exporting.load()) {
+                // Export finished while the popup was up; the clip is saved, so carry out the quit
+                app.quit_prompt_open = false;
+                running = false;
+            } else if (!ImGui::IsPopupOpen("Export in progress")) {
+                ImGui::OpenPopup("Export in progress");
+            }
+        }
+
+        ImGui::SetNextWindowPos(viewport->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        if (ImGui::BeginPopupModal("Export in progress", nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove)) {
+            if (!app.quit_prompt_open) {
+                ImGui::CloseCurrentPopup();
+            }
+
+            ImGui::Text("An export is still running.");
+            ImGui::Spacing();
+            ImGui::TextDisabled("Quitting now cancels it and deletes the unfinished file:");
+            ImGui::TextDisabled("%s", app.export_out_path.c_str());
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            if (ImGui::Button("Cancel export and quit", ImVec2(190.0f, 0.0f))) {
+                cancel_export(app);
+                app.quit_prompt_open = false;
+                running = false;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Keep exporting", ImVec2(150.0f, 0.0f)) ||
+                ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+                app.quit_prompt_open = false;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+
         // Render ImGui overlay on top of the video
         ImGui::Render();
         glViewport(0, 0, draw_w, draw_h);
@@ -926,6 +1009,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Cleanup resources
+    finish_export(app); // No-op unless an export thread is still around
     mpv_render_context_free(app.mpv_gl);
     mpv_terminate_destroy(app.mpv);
 
