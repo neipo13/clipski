@@ -906,6 +906,13 @@ int main(int argc, char* argv[]) {
 
         // Inform libmpv that swap buffers completed (needed for smooth video timing)
         mpv_render_context_report_swap(app.mpv_gl);
+
+        // While a text field is focused, keep rendering every frame. ImGui spreads a keystroke's
+        // key-down and its character over separate frames, so with event-driven sleep the
+        // character would otherwise sit in ImGui's queue until the next keypress arrives.
+        if (io.WantTextInput) {
+            redraw = true;
+        }
     }
 
     // Cleanup resources
