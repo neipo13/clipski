@@ -11,11 +11,13 @@ A fast, minimal, single-file C++17 desktop video trimmer for Windows built with 
 - **Right-Click Context Menu Integration:** Right-click any video file (`.mp4`, `.mkv`, `.mov`, `.webm`, `.avi`) in Windows Explorer and select **Trim with Clipski** (or drag and drop files directly into the window).
 - **Hardware-Accelerated Playback:** Powered by `libmpv` (`hwdec=auto`) rendering directly to an OpenGL 3.2 Core context with zero idle CPU usage (`SDL_WaitEvent` + `mpv_render_context_set_update_callback`).
 - **Live Clip Loop Preview (`L`):** Toggle **Loop Clip** to lock playback and the timeline scrubber strictly between your `Start` and `End` trim points using `libmpv`'s hardware A-B loop.
-- **One-Click Discord & Lossless Exports:**
+- **One-Click Discord & Full-Quality Exports:**
   - **Custom Clip Naming:** Type an optional name (e.g. `"clean reset pop"`) to automatically format spaces as `-` (`clean-reset-pop.mp4`) and omit the `_compressed` suffix, or leave blank to use the original filename + preset suffix.
-  - **Save Discord 1080p:** Exports `<name>_compressed_1080.mp4` (`60fps`, `libx264`, `-crf 23`, `-preset slower`).
-  - **Save Discord 720p:** Exports `<name>_compressed_720.mp4` (`60fps`, `libx264`, `-crf 32`, `-preset slower`).
-  - **Save Raw Copy:** Exports `<name>_trimmed.mp4` (`-c copy`, instant lossless stream copy with zero re-encoding).
+  - **Save Discord 1080p:** Exports `<name>_compressed_1080.mp4` (1080p60, 12 Mbps on GPU: ~33s fits under Discord's 50 MB).
+  - **Save Discord 720p:** Exports `<name>_compressed_720.mp4` (720p60, 4 Mbps on GPU: a full 60s replay is ~29 MB).
+  - **Save Full Quality:** Exports `<name>_full.mp4` at the source resolution and the source's own bitrate, cut exactly at your start/end points.
+  - **Fast (GPU) toggle (on by default):** Encodes on the AMD GPU (`h264_amf`), about 10x faster than the old CPU presets. Turn it off to encode on the CPU (`libx264 -preset medium`), e.g. if GPU exports fail on a non-AMD card.
+  - If the output file already exists, `_2`, `_3`, ... is appended instead of overwriting.
   - Runs `ffmpeg.exe` asynchronously in the background with no console popups or UI freezing.
 
 ---
@@ -100,13 +102,14 @@ PEAK = peak
 
 Open [`src/main.cpp`](src/main.cpp) and edit the command templates at the top of the file:
 ```cpp
-static const std::string FFMPEG_ARGS_DISCORD_1080P =
-    "-y -ss {start} -to {end} -i \"{input}\" -vf \"scale=-2:1080,fps=60\" -crf 23 -preset slower -c:v libx264 -c:a aac -b:a 128k \"{output}\"";
+// CPU presets (Fast (GPU) toggle off)
+static const std::string FFMPEG_ARGS_DISCORD_1080P_CPU = ...;
+static const std::string FFMPEG_ARGS_DISCORD_720P_CPU  = ...;
+static const std::string FFMPEG_ARGS_FULL_QUALITY_CPU  = ...;
 
-static const std::string FFMPEG_ARGS_DISCORD_720P =
-    "-y -ss {start} -to {end} -i \"{input}\" -vf \"scale=-2:720,fps=60\" -crf 32 -preset slower -c:v libx264 -c:a aac -b:a 128k \"{output}\"";
-
-static const std::string FFMPEG_ARGS_LOSSLESS_COPY =
-    "-y -ss {start} -to {end} -i \"{input}\" -c copy \"{output}\"";
+// GPU presets (Fast (GPU) toggle on)
+static const std::string FFMPEG_ARGS_DISCORD_1080P_GPU = ...;
+static const std::string FFMPEG_ARGS_DISCORD_720P_GPU  = ...;
+static const std::string FFMPEG_ARGS_FULL_QUALITY_GPU  = ...;
 ```
 Then run `cmake --build build --config Release` to update `clipski.exe`.

@@ -31,21 +31,34 @@ namespace fs = std::filesystem;
 
 // ============================================================================
 // FFmpeg Encoding Presets (Matching your C:\Scripts\ffmpeg Discord scripts)
-// Available placeholders: {start}, {end}, {input}, {output}
+// Available placeholders: {start}, {end}, {input}, {output},
+//   {bitrate}, {maxrate} (Full Quality only: the source file's average bitrate, and 1.5x that)
 // ============================================================================
-static const std::string FFMPEG_ARGS_DISCORD_1080P =
-    "-y -ss {start} -to {end} -i \"{input}\" -vf \"scale=-2:1080,fps=60\" -crf 23 -preset slower -c:v libx264 -c:a aac -b:a 128k \"{output}\"";
+// CPU ("Fast (GPU)" off): libx264 "medium" - ~3x faster than "slower" at nearly the same size/look.
+static const std::string FFMPEG_ARGS_DISCORD_1080P_CPU =
+    "-y -ss {start} -to {end} -i \"{input}\" -vf \"scale=-2:1080,fps=60\" -crf 23 -preset medium -c:v libx264 -c:a aac -b:a 128k \"{output}\"";
 
-static const std::string FFMPEG_ARGS_DISCORD_720P =
-    "-y -ss {start} -to {end} -i \"{input}\" -vf \"scale=-2:720,fps=60\" -crf 32 -preset slower -c:v libx264 -c:a aac -b:a 128k \"{output}\"";
+static const std::string FFMPEG_ARGS_DISCORD_720P_CPU =
+    "-y -ss {start} -to {end} -i \"{input}\" -vf \"scale=-2:720,fps=60\" -crf 32 -preset medium -c:v libx264 -c:a aac -b:a 128k \"{output}\"";
 
-static const std::string FFMPEG_ARGS_LOSSLESS_COPY =
-    "-y -ss {start} -to {end} -i \"{input}\" -c copy \"{output}\"";
+static const std::string FFMPEG_ARGS_FULL_QUALITY_CPU =
+    "-y -ss {start} -to {end} -i \"{input}\" -c:v libx264 -preset medium -b:v {bitrate} -maxrate {maxrate} -bufsize {maxrate} -c:a copy \"{output}\"";
+
+// GPU ("Fast (GPU)" on, default): AMD AMF H.264 at fixed bitrates, ~10x faster than CPU "slower".
+// 1080p @ 12 Mbps fits ~33s under Discord's 50 MB; 720p @ 4 Mbps fits a full 60s replay (~29 MB).
+static const std::string FFMPEG_ARGS_DISCORD_1080P_GPU =
+    "-y -ss {start} -to {end} -i \"{input}\" -vf \"scale=-2:1080,fps=60\" -c:v h264_amf -usage transcoding -quality quality -rc vbr_peak -b:v 12M -maxrate 18M -preanalysis 1 -c:a aac -b:a 128k \"{output}\"";
+
+static const std::string FFMPEG_ARGS_DISCORD_720P_GPU =
+    "-y -ss {start} -to {end} -i \"{input}\" -vf \"scale=-2:720,fps=60\" -c:v h264_amf -usage transcoding -quality quality -rc vbr_peak -b:v 4M -maxrate 6M -preanalysis 1 -c:a aac -b:a 128k \"{output}\"";
+
+static const std::string FFMPEG_ARGS_FULL_QUALITY_GPU =
+    "-y -ss {start} -to {end} -i \"{input}\" -c:v h264_amf -usage transcoding -quality quality -rc vbr_peak -b:v {bitrate} -maxrate {maxrate} -preanalysis 1 -c:a copy \"{output}\"";
 
 enum class ExportPreset {
     Discord1080p,
     Discord720p,
-    StreamCopy
+    FullQuality // Re-encoded at source resolution so cuts land exactly on the set start/end
 };
 
 // ============================================================================
@@ -80,6 +93,7 @@ struct AppState {
     float trim_start = 0.0f;
     float trim_end   = 0.0f;
     bool  loop_clip  = false; // When true, loops strictly between trim_start and trim_end
+    bool  use_gpu    = true;  // "Fast (GPU)" toggle: encode exports on the GPU instead of the CPU
 
     // The export thread only touches export_Result; everything else is UI-thread only
     std::atomic<bool> is_exporting{false};
@@ -424,23 +438,25 @@ static void start_export_async(AppState& app, ExportPreset preset) {
     std::string args;
     std::string label;
 
+    const bool gpu = app.use_gpu;
     switch (preset) {
         case ExportPreset::Discord1080p:
             suffix = "_compressed_1080.mp4";
-            args   = FFMPEG_ARGS_DISCORD_1080P;
-            label  = "Exporting Discord 1080p (x264 slower)...";
+            args   = gpu ? FFMPEG_ARGS_DISCORD_1080P_GPU : FFMPEG_ARGS_DISCORD_1080P_CPU;
+            label  = "Exporting Discord 1080p";
             break;
         case ExportPreset::Discord720p:
             suffix = "_compressed_720.mp4";
-            args   = FFMPEG_ARGS_DISCORD_720P;
-            label  = "Exporting Discord 720p (x264 slower)...";
+            args   = gpu ? FFMPEG_ARGS_DISCORD_720P_GPU : FFMPEG_ARGS_DISCORD_720P_CPU;
+            label  = "Exporting Discord 720p";
             break;
-        case ExportPreset::StreamCopy:
-            suffix = "_trimmed.mp4";
-            args   = FFMPEG_ARGS_LOSSLESS_COPY;
-            label  = "Exporting Fast Stream Copy...";
+        case ExportPreset::FullQuality:
+            suffix = "_full.mp4";
+            args   = gpu ? FFMPEG_ARGS_FULL_QUALITY_GPU : FFMPEG_ARGS_FULL_QUALITY_CPU;
+            label  = "Exporting Full Quality";
             break;
     }
+    label += gpu ? " (GPU)..." : " (CPU)...";
 
     fs::path in_path = fs::u8path(app.current_file);
     fs::path out_dir = resolve_output_directory(app.config, in_path);
@@ -468,6 +484,18 @@ static void start_export_async(AppState& app, ExportPreset preset) {
     replace_all(args, "{end}", format_seconds_Arg(app.trim_end));
     replace_all(args, "{input}", in_path.u8string());
     replace_all(args, "{output}", out_path.u8string());
+
+    // Full Quality keeps the source's own average bitrate (file size / duration): re-encoding
+    // a low-bitrate clip at a higher rate only makes it bigger, since the lost detail can't come back.
+    if (args.find("{bitrate}") != std::string::npos) {
+        uintmax_t size_bytes = fs::file_size(in_path, ec);
+        long long kbps = 20000; // Fallback if size or duration is unknown
+        if (!ec && size_bytes > 0 && app.duration > 0.0) {
+            kbps = std::max(500LL, static_cast<long long>(size_bytes * 8.0 / app.duration / 1000.0));
+        }
+        replace_all(args, "{bitrate}", std::to_string(kbps) + "k");
+        replace_all(args, "{maxrate}", std::to_string(kbps * 3 / 2) + "k");
+    }
 
     // Launch ffmpeg here on the UI thread so the app owns the process handle (needed to cancel on quit)
     std::wstring wcmd = utf8_to_wide("ffmpeg.exe " + args);
@@ -917,10 +945,17 @@ int main(int argc, char* argv[]) {
                 start_export_async(app, ExportPreset::Discord720p);
             }
             ImGui::SameLine();
-            if (ImGui::Button("Save Raw Copy", ImVec2(115.0f, 0.0f))) {
-                start_export_async(app, ExportPreset::StreamCopy);
+            if (ImGui::Button("Save Full Quality", ImVec2(140.0f, 0.0f))) {
+                start_export_async(app, ExportPreset::FullQuality);
             }
             if (!can_export) ImGui::EndDisabled();
+
+            ImGui::SameLine();
+            ImGui::Checkbox("Fast (GPU)", &app.use_gpu);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("On: encode on the AMD GPU (much faster).\n"
+                                  "Off: encode on the CPU (slower; use if GPU exports fail).");
+            }
 
             ImGui::SameLine();
             if (app.is_exporting.load()) {
