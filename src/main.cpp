@@ -450,7 +450,14 @@ static void start_export_async(AppState& app, ExportPreset preset) {
                                        ? (in_path.stem().u8string() + suffix)
                                        : (custom_sanitized + ".mp4");
 
+    // Never overwrite an earlier export: append _2, _3, ... until the name is free
     fs::path out_path = out_dir / fs::u8path(final_filename);
+    if (fs::exists(out_path, ec)) {
+        std::string base = fs::u8path(final_filename).stem().u8string();
+        for (int n = 2; fs::exists(out_path, ec); ++n) {
+            out_path = out_dir / fs::u8path(base + "_" + std::to_string(n) + ".mp4");
+        }
+    }
 
     replace_all(args, "{start}", format_seconds_Arg(app.trim_start));
     replace_all(args, "{end}", format_seconds_Arg(app.trim_end));
